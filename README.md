@@ -1,106 +1,90 @@
-# AWS Transit Gateway — Hub-and-Spoke with Branch Isolation
+# AWS Transit Gateway Lab: Hub-and-Spoke with Branch Isolation
 
-A hands-on AWS networking lab that connects three VPCs through a Transit Gateway, where the hub (core) can reach both branches, but the two branches **cannot** reach each other. Isolation is achieved purely through Transit Gateway route table **association** and **propagation** — no deny rules anywhere.
+I built this lab while studying for the AWS SAA-C03 exam. The goal was to connect three VPCs through a Transit Gateway so that a central "core" VPC can talk to two branch VPCs, but the two branches can't talk to each other.
+
+The interesting part for me was that there's no "deny" rule anywhere. The branches are isolated just because the routes between them never exist.
 
 ## Architecture
 
 ```mermaid
 flowchart TB
     CORE["VPC-CORE<br/>10.0.0.0/16<br/>core-svc"]
-    TGW(("tgw-lab<br/>Transit Gateway"))
+    TGW["tgw-lab<br/>Transit Gateway"]
     A["VPC-BRANCH-A<br/>10.1.0.0/16<br/>branch-a-host"]
     B["VPC-BRANCH-B<br/>10.2.0.0/16<br/>branch-b-host"]
 
-    CORE <--> TGW
-    TGW <--> A
-    TGW <--> B
-    A -. "blocked (no route)" .- B
+    CORE --- TGW
+    TGW --- A
+    TGW --- B
 ```
 
-**Target behavior**
+Both branches are attached to the same Transit Gateway, but there is no route between Branch A and Branch B.
 
-| From | To | Result |
+What I expected to see at the end:
+
+| From | To | Expected |
 |---|---|---|
-| branch-a-host | core-svc | ✅ Reachable |
-| branch-b-host | core-svc | ✅ Reachable |
-| core-svc | branch-a-host / branch-b-host | ✅ Reachable |
-| branch-a-host | branch-b-host | ❌ Not reachable (by design) |
+| branch-a-host | core-svc | works |
+| branch-b-host | core-svc | works |
+| core-svc | both branches | works |
+| branch-a-host | branch-b-host | should fail |
 
-## Environment
+## Setup
 
-- **Region:** ap-southeast-1 (Singapore)
-- **Availability Zone:** ap-southeast-1a
-- **Instances:** Amazon Linux 2023, t3.micro
-- **Web server:** Apache (httpd) installed via EC2 user data
+- Region: ap-southeast-1 (Singapore), everything in ap-southeast-1a
+- EC2: Amazon Linux 2023, t3.micro
+- Each instance runs Apache so I can test with curl
 
-## CIDR Plan
+| VPC | CIDR | Subnet | Instance | Private IP |
+|---|---|---|---|---|
+| VPC-CORE | 10.0.0.0/16 | core-public-1 (10.0.1.0/24) | core-svc | 10.0.1.154 |
+| VPC-BRANCH-A | 10.1.0.0/16 | branch-a-public-1 (10.1.1.0/24) | branch-a-host | 10.1.1.234 |
+| VPC-BRANCH-B | 10.2.0.0/16 | branch-b-public-1 (10.2.1.0/24) | branch-b-host | 10.2.1.28 |
 
-| Site | VPC | VPC CIDR | Subnet | Subnet CIDR | EC2 | Private IP |
-|---|---|---|---|---|---|---|
-| Hub / shared services | VPC-CORE | 10.0.0.0/16 | core-public-1 | 10.0.1.0/24 | core-svc | 10.0.1.154 |
-| Branch A | VPC-BRANCH-A | 10.1.0.0/16 | branch-a-public-1 | 10.1.1.0/24 | branch-a-host | 10.1.1.234 |
-| Branch B | VPC-BRANCH-B | 10.2.0.0/16 | branch-b-public-1 | 10.2.1.0/24 | branch-b-host | 10.2.1.28 |
+I picked the CIDRs so the second number tells you which site it is (10.0 core, 10.1 branch A, 10.2 branch B). It made the route tables much easier to read later.
 
-Non-overlapping /16 blocks keep Transit Gateway routing simple — the second octet identifies the site.
+## How the isolation works
 
-## Transit Gateway Design
+### 1. Turn off the TGW defaults
 
-The Transit Gateway was created with **Default route table association** and **Default route table propagation** both **disabled**. If left enabled, every attachment joins one shared route table and learns every other attachment's routes, giving full-mesh connectivity and defeating the segmentation.
+When creating the Transit Gateway I unchecked **Default route table association** and **Default route table propagation**. If these stay on, all attachments go into one shared route table and everything can reach everything, which breaks the whole point of the lab.
 
-### Attachments
+### 2. Two TGW route tables
 
-| Attachment | VPC | Subnet |
-|---|---|---|
-| attach-core | VPC-CORE | core-public-1 |
-| attach-branch-a | VPC-BRANCH-A | branch-a-public-1 |
-| attach-branch-b | VPC-BRANCH-B | branch-b-public-1 |
+I created one attachment per VPC (`attach-core`, `attach-branch-a`, `attach-branch-b`) and two route tables:
 
-### TGW Route Tables
-
-| Route table | Associated with (who uses it) | Propagations (who can be reached) | Resulting routes |
+| Route table | Associated with | Propagations | Routes it ends up with |
 |---|---|---|---|
 | rt-core | attach-core | attach-branch-a, attach-branch-b | 10.1.0.0/16, 10.2.0.0/16 |
-| rt-branches | attach-branch-a, attach-branch-b | attach-core | 10.0.0.0/16 only |
+| rt-branches | attach-branch-a, attach-branch-b | attach-core | 10.0.0.0/16 |
 
-- **Association** = which route table an attachment's outbound traffic is looked up in.
-- **Propagation** = which route tables an attachment's CIDR is advertised into.
+The way I remember it:
+- Association = which table I look at when I send traffic
+- Propagation = which tables my CIDR gets added to so others can find me
 
-Because neither branch CIDR is ever propagated into `rt-branches`, a packet from Branch A to Branch B has no matching route and is silently dropped by the TGW.
+Since neither branch CIDR is propagated into rt-branches, Branch A has no route to Branch B and the TGW just drops the packet.
 
-### VPC Subnet Route Tables
+### 3. VPC route tables
 
-| Subnet route table | Routes added |
+The TGW route tables aren't enough on their own. Each VPC's subnet route table also needs to send traffic to the TGW:
+
+| Route table | Added route |
 |---|---|
-| core-public-1 | 10.1.0.0/16 → tgw-lab, 10.2.0.0/16 → tgw-lab |
+| core-public-1 | 10.1.0.0/16 and 10.2.0.0/16 → tgw-lab |
 | branch-a-public-1 | 10.0.0.0/16 → tgw-lab |
 | branch-b-public-1 | 10.0.0.0/16 → tgw-lab |
 
-Each also keeps `local` and `0.0.0.0/0 → Internet Gateway` (for SSH and package installs).
+### 4. Security groups
 
-### Security Groups (defense in depth)
-
-| Security group | Inbound rules |
+| Instance | Inbound |
 |---|---|
-| core-svc-sg | SSH 22 ← My IP, HTTP 80 ← 10.1.0.0/16, HTTP 80 ← 10.2.0.0/16 |
-| branch-a-sg | SSH 22 ← My IP, HTTP 80 ← 10.0.0.0/16 |
-| branch-b-sg | SSH 22 ← My IP, HTTP 80 ← 10.0.0.0/16 |
+| core-svc | SSH from my IP, HTTP from 10.1.0.0/16 and 10.2.0.0/16 |
+| branch-a-host | SSH from my IP, HTTP from 10.0.0.0/16 |
+| branch-b-host | SSH from my IP, HTTP from 10.0.0.0/16 |
 
-Routing already blocks branch-to-branch traffic; the security groups state the same intent explicitly in case the network path ever changes.
+Routing already blocks branch to branch traffic, but I didn't open the security groups between the branches either, just to be safe.
 
-## Implementation Steps
-
-1. Planned non-overlapping CIDR blocks and chose a single Region.
-2. Created three VPCs, each with one public subnet, an Internet Gateway and a route table.
-3. Created one key pair and reused it for all three instances.
-4. Launched three EC2 instances with user data that installs httpd and publishes the hostname and private IP.
-5. Created the Transit Gateway with default association and propagation **disabled**.
-6. Created one VPC attachment per VPC and waited for all to become Available.
-7. Created two TGW route tables (`rt-core`, `rt-branches`) and configured associations and propagations.
-8. Added routes to each VPC subnet route table pointing remote CIDRs at the Transit Gateway.
-9. Added HTTP inbound rules to the security groups.
-10. Verified connectivity with `curl` from every instance.
-
-## User Data Script
+## User data
 
 ```bash
 #!/bin/bash
@@ -111,92 +95,77 @@ PRIVIP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/la
 echo "<h1>$(hostname): $PRIVIP</h1>" > /var/www/html/index.html
 ```
 
-## Verification
+## Testing
 
-Tests were run over SSH from each instance using a 5-second timeout so blocked paths fail quickly:
+I SSH'd into each instance and ran curl against the others with a 5 second timeout:
 
 ```bash
-curl -m 5 http://<target-private-ip>
+curl -m 5 http://<private-ip>
 ```
 
 | From | To | Result |
 |---|---|---|
-| branch-a-host | core-svc (10.0.1.154) | ✅ HTML returned |
-| branch-a-host | branch-b-host (10.2.1.28) | ❌ `Connection timed out after 5002 milliseconds` |
-| branch-b-host | core-svc (10.0.1.154) | ✅ HTML returned |
-| branch-b-host | branch-a-host (10.1.1.234) | ❌ `Connection timed out after 5002 milliseconds` |
-| core-svc | branch-a-host (10.1.1.234) | ✅ HTML returned |
-| core-svc | branch-b-host (10.2.1.28) | ✅ HTML returned |
+| branch-a-host | core-svc | got the HTML page |
+| branch-a-host | branch-b-host | Connection timed out after 5002 ms |
+| branch-b-host | core-svc | got the HTML page |
+| branch-b-host | branch-a-host | Connection timed out after 5002 ms |
+| core-svc | branch-a-host | got the HTML page |
+| core-svc | branch-b-host | got the HTML page |
 
-A **timeout** (rather than an immediate "connection refused") is the expected signature of a missing route: the packet has nowhere to go and is dropped, instead of reaching the host and being rejected.
+Everything matched what I expected. The branch to branch tests time out instead of getting "connection refused", which makes sense because the packet never reaches the other host. There's just no route for it.
+
+## Problems I ran into
+
+**The web page showed no IP address.** The original user data script used the old metadata call without a token. Amazon Linux 2023 only allows IMDSv2 by default, so the call returned nothing. I switched to the token version above.
+
+**I added user data after launching.** I forgot to paste the script before launching the first time. User data only runs on first boot, so I had to relaunch the instances.
+
+**I mixed up association and propagation.** My first attempt had rt-core with a route to 10.0.0.0/16 (its own VPC) and the branch routes in rt-branches, which is completely backwards. I only noticed by looking at the Routes tab. Fixed it by deleting and recreating the propagations on the right tables.
+
+**Security group rules weren't applying.** When I relaunched with "Launch more like this", AWS created new security groups with -1, -2, -3 at the end. I had been editing the old ones. Lesson learned: check the instance's Security tab to see which group is actually attached.
+
+**EC2 Instance Connect didn't work.** Because SSH was limited to my IP, the browser based Instance Connect couldn't get in (it connects from AWS's IP range, not mine). I used SSH from my Mac terminal with the key pair instead.
+
+## What I learned
+
+- TGW isolation is about which routes exist, not about blocking rules.
+- Association and propagation are easy to confuse. Checking the actual Routes tab is the fastest way to catch mistakes.
+- You need routes in both places: the VPC route table and the TGW route table.
 
 ## Screenshots
 
 ### VPCs
-![VPCs](screenshots/01-vpcs.png)
+![VPCs](lab-screenshot/01-vpcs.png)
 
-### Transit Gateway (default association/propagation disabled)
-![TGW Settings](screenshots/02-tgw-settings.png)
+### Transit Gateway settings
+![TGW Settings](lab-screenshot/02-tgw-settings.png)
 
-### TGW Attachments
-![Attachments](screenshots/03-tgw-attachments.png)
+### TGW attachments
+![Attachments](lab-screenshot/03-tgw-attachments.png)
 
 ### rt-core
-![rt-core associations](screenshots/04a-rt-core-associations.png)
-![rt-core routes](screenshots/04b-rt-core-routes.png)
-![rt-core propagations](screenshots/04c-rt-core-propagations.png)
+![rt-core associations](lab-screenshot/04a-rt-core-associations.png)
+![rt-core routes](lab-screenshot/04b-rt-core-routes.png)
 
 ### rt-branches
-![rt-branches associations](screenshots/05a-rt-branches-associations.png)
-![rt-branches routes](screenshots/05b-rt-branches-routes.png)
+![rt-branches associations](lab-screenshot/05a-rt-branches-associations.png)
+![rt-branches routes](lab-screenshot/05b-rt-branches-routes.png)
 
-### VPC Subnet Route Tables
-![core route table](screenshots/06a-core-route-table.png)
-![branch-a route table](screenshots/06b-branch-a-route-table.png)
-![branch-b route table](screenshots/06c-branch-b-route-table.png)
+### VPC route tables
+![core route table](lab-screenshot/06a-core-route-table.png)
+![branch-a route table](lab-screenshot/06b-branch-a-route-table.png)
+![branch-b route table](lab-screenshot/06c-branch-b-route-table.png)
 
-### Security Groups
-![core-svc-sg](screenshots/07a-core-svc-sg.png)
-![branch-a-sg](screenshots/07b-branch-a-sg.png)
-![branch-b-sg](screenshots/07c-branch-b-sg.png)
+### Security groups
+![core-svc security group](lab-screenshot/07a-core-svc-sg-1.png)
+![branch-a-host security group](lab-screenshot/07b-branch-a-host-sg-2.png)
+![branch-b-host security group](lab-screenshot/07c-branch-b-host-sg-3.png)
 
-### Verification (curl)
-![from branch-a](screenshots/08a-curl-from-branch-a.png)
-![from branch-b](screenshots/08b-curl-from-branch-b.png)
-![from core-svc](screenshots/08c-curl-from-core.png)
-
-## Issues I Encountered and How I Fixed Them
-
-**1. Private IP missing from the web page**
-The original user data used IMDSv1 (`curl http://169.254.169.254/...` without a token). Amazon Linux 2023 requires IMDSv2 by default, so the request returned nothing and the page showed an empty IP. Fixed by requesting a session token first (see script above).
-
-**2. User data added after launch had no effect**
-User data only runs on the instance's first boot. I relaunched the instances with the script included and terminated the originals.
-
-**3. TGW propagations applied to the wrong route tables**
-I initially propagated `attach-core` into `rt-core` (so core's table only pointed back at itself) and the branches into `rt-branches` (which would have let the branches reach each other). Checking each table's Routes tab exposed the mistake; I deleted and recreated the propagations on the correct tables.
-
-**4. Security group rules not taking effect**
-"Launch more like this" created new security groups (`-1`, `-2`, `-3`) instead of reusing the originals, so the HTTP rules I edited were attached to the terminated instances' groups. I checked each instance's Security tab, switched them to the intended groups, and deleted the extras.
-
-**5. EC2 Instance Connect unavailable**
-With SSH restricted to My IP, browser-based Instance Connect fails because its traffic originates from an AWS-managed IP range. I connected from my own terminal using the key pair instead.
-
-## Key Learnings
-
-- Transit Gateway segmentation is done with **multiple route tables**, not deny rules — a route that was never propagated cannot be used.
-- **Association** controls where an attachment looks up routes; **propagation** controls where its CIDR is advertised. An attachment is associated with exactly one route table but can propagate to many.
-- Disabling default association and propagation when creating the TGW is essential for any segmented design.
-- Both layers of routing are required: the **VPC subnet route table** must send remote CIDRs to the TGW, and the **TGW route table** decides where traffic goes next.
-- Always verify the route table actually associated with a subnet, the security group actually attached to an instance, and the actual Routes tab — not just the configuration you intended.
+### curl tests
+![from branch-a](lab-screenshot/08a-curl-from-branch-a.webp)
+![from branch-b](lab-screenshot/08b-curl-from-branch-b.webp)
+![from core-svc](lab-screenshot/08c-curl-from-core.webp)
 
 ## Cleanup
 
-Resources were deleted in dependency order to avoid ongoing charges:
-
-1. EC2 instances
-2. Transit Gateway attachments
-3. Transit Gateway route tables
-4. Transit Gateway
-5. VPCs (including subnets, route tables, Internet Gateways and security groups)
-6. Key pair
+Deleted everything afterwards so I wouldn't keep paying for the TGW attachments: instances, TGW attachments, TGW route tables, the TGW itself, the VPCs, and the key pair.
